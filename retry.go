@@ -1,46 +1,25 @@
 package httpxgo
 
 import (
-	"fmt"
+	"crypto/tls"
+	"errors"
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 )
 
-type RetryPollError struct {
-	Attempts       int
-	TotalSleepTime time.Duration
-	ReqURL         string
-	ReqMethod      string
-	ResponseError  error
-}
-
-func (e RetryPollError) Error() string {
-	resErr := ""
-	if e.ResponseError != nil {
-		resErr = e.ResponseError.Error()
-	}
-	return fmt.Sprintf(
-		"RetryHook: retry failed after attempts=%d, total_time=%s, req_method=%s, req_url=%s, res_err=%s",
-		e.Attempts,
-		e.TotalSleepTime,
-		e.ReqMethod,
-		e.ReqURL,
-		resErr,
-	)
-}
-
 type Retry struct {
 	// static wait time between retry. If Backoff is set then wait won't be used
 	Wait time.Duration
 	// maxmium polling attempts to be performed before failing
-	PollLimit int
+	Count int
 	// Cond is condition in retry, all the post processing logic should go here such response
-	// parsing and status code checks. If Cond return true then request retried if false then
-	// request is considered success and retry stops.
+	// parsing and status code checks. If Cond return true then request retried if false then retry
+	// stops.
 	Cond func(*Response, error) bool
 	// Backoff will use exponential backoff with jitter if nil static wait will be used
 	Backoff *BackoffWithJitter
@@ -48,14 +27,8 @@ type Retry struct {
 
 func NewRetry() *Retry {
 	return &Retry{
-		PollLimit: 10,
-		Wait:      20 * time.Second,
-		Cond: func(r *Response, err error) bool {
-			if err != nil {
-				return true
-			}
-			return !r.Success()
-		},
+		Count: 10,
+		Wait:  20 * time.Second,
 	}
 }
 
@@ -114,8 +87,8 @@ func (b *BackoffWithJitter) NextWaitDuration(
 			}
 		}
 	}
-	// min(cap, base * attempt**1.5) 1.5 exponential component for smooth and low latency retry
-	exp := time.Duration(min(float64(b.max), float64(b.min)*math.Pow(1.5, float64(attempt))))
+	// min(cap, base * 2**attempt)
+	exp := time.Duration(min(float64(b.max), float64(b.min)*math.Exp2(float64(attempt))))
 	return b.balanceMinMax(b.randDuration(exp))
 }
 
@@ -127,10 +100,10 @@ func (b *BackoffWithJitter) randDuration(exp time.Duration) time.Duration {
 	}
 	switch b.strategy {
 	case FullJitter:
-		// (0 + exp)
+		// random_between(0, exp)
 		return time.Duration(b.rnd.Int64N(int64(exp)))
 	case EqualJitter:
-		// (exp/2 + exp)
+		// (exp/2 + random_between(0, exp/2))
 		half := int64(exp / 2)
 		return time.Duration(half + b.rnd.Int64N(half))
 	case DecorrelatedJitter:
@@ -138,8 +111,7 @@ func (b *BackoffWithJitter) randDuration(exp time.Duration) time.Duration {
 		if b.prev == 0 {
 			b.prev = b.min
 		}
-		maxRange := max(b.prev*3, b.min)
-		next := min(b.max, b.min+time.Duration(b.rnd.Int64N(int64(maxRange-b.min))))
+		next := min(b.max, b.min+time.Duration(b.rnd.Int64N(int64((b.prev*3)-b.min))))
 		b.prev = next
 		return next
 	default:
@@ -181,4 +153,36 @@ func ParseRetryHeader(v string) (time.Duration, bool) {
 	}
 	// date is in the past
 	return 0, true
+}
+
+func defaultRetryCondition(res *Response, err error) bool {
+	var (
+		certErr *tls.CertificateVerificationError
+		urlErr  *url.Error
+	)
+
+	if errors.As(err, &certErr) {
+		return false
+	}
+
+	if errors.As(err, &urlErr) {
+		errStr := urlErr.Err.Error()
+		if strings.Contains(errStr, "redirects") || strings.Contains(errStr, "invalid header") ||
+			strings.Contains(errStr, "unsupported protocol scheme") {
+			return false
+		}
+		return urlErr.Temporary()
+	}
+
+	if res == nil {
+		return false
+	}
+
+	if res.StatusCode == http.StatusTooManyRequests ||
+		(res.StatusCode >= 500 && res.StatusCode != http.StatusNotImplemented) ||
+		res.StatusCode == 0 {
+		return true
+	}
+
+	return false
 }
