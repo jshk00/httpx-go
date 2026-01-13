@@ -3,7 +3,6 @@ package httpxgo
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -11,8 +10,8 @@ import (
 )
 
 type Request struct {
-	responseHook            ResponseHook
-	requestHook             []RequestHook
+	respHooks               []ResponseHook
+	reqHooks                []RequestHook
 	client                  *Client
 	tracer                  *TraceInfo
 	ctx                     context.Context
@@ -30,13 +29,14 @@ type Request struct {
 	AlloweDeletePayload     bool
 	AllowNonIdempotentRetry bool
 	RawRequest              *http.Request
+	TotalTime               time.Duration
 }
 
 func NewRequest() *Request {
 	return &Request{
-		Header:      make(http.Header),
-		Queries:     make(url.Values),
-		requestHook: []RequestHook{DefaultRequestHook},
+		Header:   make(http.Header),
+		Queries:  make(url.Values),
+		reqHooks: []RequestHook{DefaultRequestHook},
 	}
 }
 
@@ -112,12 +112,12 @@ func (r *Request) SetQueries(queries map[string]string) *Request {
 }
 
 func (r *Request) SetRequestHook(hook RequestHook) *Request {
-	r.requestHook = append(r.requestHook, hook)
+	r.reqHooks = append(r.reqHooks, hook)
 	return r
 }
 
 func (r *Request) SetResponseHook(hook ResponseHook) *Request {
-	r.responseHook = hook
+	r.respHooks = append(r.respHooks, hook)
 	return r
 }
 
@@ -181,48 +181,66 @@ func (r *Request) isPayloadAllowed() bool {
 //     (e.g. decoding JSON, logging, validation) in the Cond function itself.
 func (r *Request) Exec() (*Response, error) {
 	var (
-		totalWait time.Duration
-		err       error
+		res *Response
+		err error
+		now = time.Now()
 	)
 
-	if r.IsRetry && r.isIdempotent() {
-		for attempt := 1; attempt <= r.retry.PollLimit; attempt++ {
-			r.Attempt = attempt
-			res, err := r.client.exec(r)
-			if err != nil {
-				ctxErr := r.Context().Err()
-				if ctxErr != nil && errors.Is(ctxErr, context.DeadlineExceeded) {
-					return nil, ctxErr
-				}
+	// If retry is nil set it because we need retry.Count
+	if r.retry == nil {
+		r.retry = &Retry{}
+	}
+
+	if r.retry.Count < 0 {
+		r.retry.Count = 0
+	}
+
+Loop:
+	for attempt := 0; attempt <= r.retry.Count; attempt++ {
+		r.Attempt++
+		res, err = r.client.exec(r)
+		if err != nil {
+			ctxErr := r.Context().Err()
+			if ctxErr != nil && errors.Is(ctxErr, context.DeadlineExceeded) {
+				break
 			}
-			if !r.retry.Cond(res, err) {
-				return res, nil
+		}
+
+		if r.Attempt-1 == r.retry.Count && r.isIdempotent() {
+			break
+		}
+
+		if r.IsRetry {
+			// Default condition will always be checked
+			needsRetry := defaultRetryCondition(res, err)
+			// if default condition is false then execute the user one
+			if !needsRetry && r.retry.Cond != nil && res != nil {
+				needsRetry = r.retry.Cond(res, err)
 			}
-			// drain some of the resposne body before wait so tcp keep alive be reuse the connection
+
+			if !needsRetry {
+				break
+			}
+
 			if res != nil && res.Body != nil {
-				_, _ = io.CopyN(io.Discard, res.Body, 2048)
+				_, _ = io.Copy(io.Discard, res.Body)
 				res.Body.Close()
 			}
+
 			if r.retry.Backoff != nil {
 				r.retry.Wait = r.retry.Backoff.NextWaitDuration(res, attempt)
 			}
-			totalWait += r.retry.Wait
-			time.Sleep(r.retry.Wait)
-		}
-		return nil, RetryPollError{
-			Attempts:       r.retry.PollLimit,
-			TotalSleepTime: totalWait,
-			ReqURL:         r.URI,
-			ReqMethod:      r.Method,
-			ResponseError:  err,
-		}
-	}
 
-	res, err := r.client.exec(r)
-	if r.responseHook != nil && r.requestHook == nil {
-		if err := r.responseHook(r.client, res); err != nil {
-			return nil, fmt.Errorf("failed to execute response hook: %w", err)
+			timer := time.NewTimer(r.retry.Wait)
+			select {
+			case <-r.Context().Done():
+				err = r.Context().Err()
+				break Loop
+			case <-timer.C:
+			}
+			timer.Stop()
 		}
 	}
+	r.TotalTime = time.Since(now)
 	return res, err
 }

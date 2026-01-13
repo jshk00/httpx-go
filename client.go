@@ -9,7 +9,7 @@ type Client struct {
 	breaker             *CircuitBreaker
 	client              *http.Client
 	trace               bool
-	decompressors       *decompressors
+	decompressors       *contentTypeDecompressor
 	contentTypeEncoders *contentTypeEncoders
 	contentTypeDecoders *contentTypeDecoders
 }
@@ -67,17 +67,29 @@ func (c *Client) SetCookieJar(jar http.CookieJar) *Client {
 // encodings, register a decompressor using the exact header value (e.g. "gzip, zlib") and implement
 // the decoding chain inside the provided function in reverse application order:
 //
-//	// Example for: Content-Encoding: gzip, zlib
-//	func(r io.Reader) (io.ReadCloser, error) {
-//	    zr, err := zlib.NewReader(r)   // decode last applied encoding first
-//	    if err != nil {
-//	        return nil, err
-//	    }
-//	    gr, err := gzip.NewReader(zr)
-//	    if err != nil {
-//	        return nil, err
-//	    }
-//	    return gr, nil
+//	type decompressor struct {
+//		s io.ReadCloser
+//		r io.Reader
+//	}
+//
+//	func (d *decompressor) Read(p []byte) (n int, err error) {
+//		return d.r.Read(p)
+//	}
+//
+//	func (d *decompressor) Close() error {
+//		return d.s.Close()
+//	}
+//
+//	func decompressCustom(r io.ReadCloser) (io.ReadCloser, error) {
+//		zr, err := zlib.NewReader(r)
+//		if err != nil {
+//			return err
+//		}
+//		gr, err := gzip.NewReader(zr)
+//		if err != nil {
+//			return err
+//		}
+//		return &decompressor{r: gr, s: r}
 //	}
 //
 // Call SetDecompressor multiple times to register additional encodings.
@@ -128,8 +140,8 @@ func (c *Client) Delete(url string) *Request {
 
 func (c *Client) exec(r *Request) (*Response, error) {
 	// Execute all the request hooks
-	for i := 0; i < len(r.requestHook); i++ {
-		if err := r.requestHook[i](c, r); err != nil {
+	for i := 0; i < len(r.reqHooks); i++ {
+		if err := r.reqHooks[i](c, r); err != nil {
 			return nil, fmt.Errorf("failed to execute request hook: %w", err)
 		}
 	}
@@ -146,6 +158,14 @@ func (c *Client) exec(r *Request) (*Response, error) {
 	}
 	if err := resp.wrapDecompressor(); err != nil {
 		return nil, err
+	}
+
+	// WARN: In case of retry if body is read in in response hooks
+	// then reading body in payload based retry condition will case issue.
+	for i := 0; i < len(r.respHooks); i++ {
+		if err := r.respHooks[i](c, resp); err != nil {
+			return nil, fmt.Errorf("failed to execute response hook: %w", err)
+		}
 	}
 	return resp, nil
 }

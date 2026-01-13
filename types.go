@@ -60,15 +60,15 @@ func (ce *contentTypeDecoders) get(key string) (ContentTypeDecFn, bool) {
 	return fn, ok
 }
 
-// decompressors is concurrent safe map of decompression function.
+// contentTypeDecompressor is concurrent safe map of decompression function.
 // It already has gzip, delfate and zlib. User can override it as well.
-type decompressors struct {
+type contentTypeDecompressor struct {
 	mu   sync.RWMutex
 	data map[string]DecompressFn
 }
 
-func newDecompressor() *decompressors {
-	return &decompressors{
+func newDecompressor() *contentTypeDecompressor {
+	return &contentTypeDecompressor{
 		data: map[string]DecompressFn{
 			"gzip":    decompressGzip,
 			"deflate": decompressFlate,
@@ -77,13 +77,13 @@ func newDecompressor() *decompressors {
 	}
 }
 
-func (ds *decompressors) put(key string, fn DecompressFn) {
+func (ds *contentTypeDecompressor) put(key string, fn DecompressFn) {
 	ds.mu.Lock()
 	ds.data[key] = fn
 	ds.mu.Unlock()
 }
 
-func (ds *decompressors) get(key string) (fn DecompressFn, ok bool) {
+func (ds *contentTypeDecompressor) get(key string) (fn DecompressFn, ok bool) {
 	ds.mu.RLock()
 	defer ds.mu.RUnlock()
 	fn, ok = ds.data[key]

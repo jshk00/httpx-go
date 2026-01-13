@@ -23,10 +23,11 @@ var (
 type Response struct {
 	*http.Response
 	traceInfo           *TraceInfo
-	decompressors       *decompressors
+	decompressors       *contentTypeDecompressor
 	contentTypeDecoders *contentTypeDecoders
 	// This set body to already read so can not be read further
-	IsRead bool
+	IsRead   bool
+	IsReused bool
 }
 
 // Success checks wether the response status code is in positive range.
@@ -43,10 +44,8 @@ func (r *Response) TraceInfo() (*TraceInfo, error) {
 
 // Decode will decode given value based on [DecodeOptions] if none provided default will be
 // [JSONDecoder]. Make sure body should be pointer to variable you're trying to decode.
-//
-// WARN: As Decode will store bytes in memory avoid reading large responses.
 func (r *Response) Decode(v any) error {
-	if r.IsRead {
+	if r.IsRead && !r.IsReused {
 		return ErrBodyIsRead
 	}
 	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -62,7 +61,7 @@ func (r *Response) Decode(v any) error {
 }
 
 func (r *Response) Bytes() ([]byte, error) {
-	if r.IsRead {
+	if r.IsRead && !r.IsReused {
 		return nil, ErrBodyIsRead
 	}
 	b, err := io.ReadAll(r.Body)
@@ -103,23 +102,27 @@ func (r *Response) wrapDecompressor() error {
 	return nil
 }
 
-// MultiReadBody Provides body which can auto reset when it hits [io.EOF] error.
-func (r *Response) MultiReadBody() (*MultiReadCloser, error) {
+// EnableMultiBodyReads buffers the response body in memory and makes it reusable across
+// multiple reads. Must call before Decode or Bytes to enabled resuse of response body.
+func (r *Response) EnableMultiBodyReads() error {
 	b, err := r.Bytes()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &MultiReadCloser{bytes.NewReader(b)}, nil
+	r.Body.Close()
+	r.Body = &nopReadCloser{bytes.NewReader(b)}
+	r.IsReused = true
+	return nil
 }
 
-// MultiReadCloser automatically reset the read buffer after reading is complete, Essentially making
-// it infinite reader.
-type MultiReadCloser struct {
+// nopReadCloser automatically reset the read buffer after
+// reading is complete, Essentially making it infinite reader.
+type nopReadCloser struct {
 	br *bytes.Reader
 }
 
 // Read implments [io.Reader] interface.
-func (r *MultiReadCloser) Read(p []byte) (int, error) {
+func (r *nopReadCloser) Read(p []byte) (int, error) {
 	n, err := r.br.Read(p)
 	if err == io.EOF {
 		r.br.Seek(0, io.SeekStart)
@@ -127,6 +130,6 @@ func (r *MultiReadCloser) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (r *MultiReadCloser) Close() error {
+func (r *nopReadCloser) Close() error {
 	return nil
 }
