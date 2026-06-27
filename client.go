@@ -3,6 +3,7 @@ package httpxgo
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 type Client struct {
@@ -24,7 +25,9 @@ func New() *Client {
 }
 
 func (c *Client) SetCircuitBreaker(b *CircuitBreaker) *Client {
-	c.breaker = b
+	if b != nil {
+		c.breaker = b
+	}
 	return c
 }
 
@@ -52,7 +55,9 @@ func (c *Client) DisableRedirect() *Client {
 
 // SetCookieJar set cookie jar with contained cookies by default no cookie jar is setup
 func (c *Client) SetCookieJar(jar http.CookieJar) *Client {
-	c.client.Jar = jar
+	if jar != nil {
+		c.client.Jar = jar
+	}
 	return c
 }
 
@@ -109,36 +114,51 @@ func (c *Client) SetContentTypeDecoder(key string, fn ContentTypeDecFn) *Client 
 }
 
 // Get is http get method
-func (c *Client) Get(url string) *Request {
-	return NewRequest().SetMethod(http.MethodGet).SetURL(url)
+func (c *Client) Get(uri string) *Request {
+	return c.R().SetMethod(http.MethodGet).SetURL(uri)
 }
 
 // Head is http head method follows upto 10 redirect
-func (c *Client) Head(url string) *Request {
-	return NewRequest().SetMethod(http.MethodHead).SetURL(url)
+func (c *Client) Head(uri string) *Request {
+	return c.R().SetMethod(http.MethodHead).SetURL(uri)
 }
 
 // Post is http post method
-func (c *Client) Post(url string, body any) *Request {
-	return NewRequest().SetMethod(http.MethodPost).SetURL(url).SetBody(body)
+func (c *Client) Post(uri string, body any) *Request {
+	return c.R().SetMethod(http.MethodPost).SetURL(uri).SetBody(body)
 }
 
 // Put is http put method
-func (c *Client) Put(url string, body any) *Request {
-	return NewRequest().SetMethod(http.MethodPut).SetURL(url).SetBody(body)
+func (c *Client) Put(uri string, body any) *Request {
+	return c.R().SetMethod(http.MethodPut).SetURL(uri).SetBody(body)
 }
 
 // Patch is http patch method
-func (c *Client) Patch(url string, body any) *Request {
-	return NewRequest().SetMethod(http.MethodPost).SetURL(url).SetBody(body)
+func (c *Client) Patch(uri string, body any) *Request {
+	return c.R().SetMethod(http.MethodPost).SetURL(uri).SetBody(body)
 }
 
 // Delete is http delete method
-func (c *Client) Delete(url string) *Request {
-	return NewRequest().SetMethod(http.MethodDelete).SetURL(url)
+func (c *Client) Delete(uri string) *Request {
+	return c.R().SetMethod(http.MethodDelete).SetURL(uri)
+}
+
+func (c *Client) R() *Request {
+	return &Request{
+		Header:   make(http.Header),
+		Queries:  make(url.Values),
+		reqHooks: []RequestHook{DefaultRequestHook},
+		client:   c,
+	}
 }
 
 func (c *Client) exec(r *Request) (*Response, error) {
+	if c.breaker != nil {
+		if err := c.breaker.Allow(); err != nil {
+			return nil, err
+		}
+	}
+
 	// Execute all the request hooks
 	for i := 0; i < len(r.reqHooks); i++ {
 		if err := r.reqHooks[i](c, r); err != nil {
@@ -149,6 +169,9 @@ func (c *Client) exec(r *Request) (*Response, error) {
 	res, err := c.client.Do(r.RawRequest) //nolint:bodyClose
 	if err != nil {
 		return nil, err
+	}
+	if c.breaker != nil && res != nil {
+		c.breaker.PostReq(res)
 	}
 	resp := &Response{
 		Response:            res,

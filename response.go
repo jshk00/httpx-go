@@ -26,8 +26,8 @@ type Response struct {
 	decompressors       *contentTypeDecompressor
 	contentTypeDecoders *contentTypeDecoders
 	// This set body to already read so can not be read further
-	IsRead   bool
-	IsReused bool
+	isRead   bool
+	isReused bool
 }
 
 // Success checks wether the response status code is in positive range.
@@ -45,7 +45,7 @@ func (r *Response) TraceInfo() (*TraceInfo, error) {
 // Decode will decode given value based on [DecodeOptions] if none provided default will be
 // [JSONDecoder]. Make sure body should be pointer to variable you're trying to decode.
 func (r *Response) Decode(v any) error {
-	if r.IsRead && !r.IsReused {
+	if r.isRead && !r.isReused {
 		return ErrBodyIsRead
 	}
 	mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
@@ -56,26 +56,27 @@ func (r *Response) Decode(v any) error {
 	if !ok {
 		return fmt.Errorf("content type decoder not found for content %s", mt)
 	}
-	r.IsRead = true
+	r.isRead = true
 	return dec(v, r.Body)
 }
 
+// Bytes returns body in byte slice if response is already read will return [ErrBodyIsRead].
 func (r *Response) Bytes() ([]byte, error) {
-	if r.IsRead && !r.IsReused {
+	if r.isRead && !r.isReused {
 		return nil, ErrBodyIsRead
 	}
 	b, err := io.ReadAll(r.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading the body, err: %w", err)
 	}
-	r.IsRead = true
+	r.isRead = true
 	return b, nil
 }
 
 // wrapDecompressor decompresses well known format such as gzip, x-gzip, deflate. Other widely used
 // format such as brotli, zstd or custom you can set decompressor using client.
 func (r *Response) wrapDecompressor() error {
-	if r.IsRead {
+	if r.isRead {
 		return ErrBodyIsRead
 	}
 
@@ -103,7 +104,7 @@ func (r *Response) wrapDecompressor() error {
 }
 
 // EnableMultiBodyReads buffers the response body in memory and makes it reusable across
-// multiple reads. Must call before Decode or Bytes to enabled resuse of response body.
+// multiple reads. Must call before [Decode] or [Bytes] to enabled resuse of response body.
 func (r *Response) EnableMultiBodyReads() error {
 	b, err := r.Bytes()
 	if err != nil {
@@ -111,8 +112,19 @@ func (r *Response) EnableMultiBodyReads() error {
 	}
 	r.Body.Close()
 	r.Body = &nopReadCloser{bytes.NewReader(b)}
-	r.IsReused = true
+	r.isReused = true
 	return nil
+}
+
+// IsRead returns true if body is already read.
+func (r *Response) IsRead() bool {
+	return r.isRead
+}
+
+// IsReused returns true if body is configured for multiple reading usually done via
+// [EnableMultiBodyReads]
+func (r *Response) IsReused() bool {
+	return r.isReused
 }
 
 // nopReadCloser automatically reset the read buffer after

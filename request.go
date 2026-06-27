@@ -32,20 +32,15 @@ type Request struct {
 	TotalTime               time.Duration
 }
 
-func NewRequest() *Request {
-	return &Request{
-		Header:   make(http.Header),
-		Queries:  make(url.Values),
-		reqHooks: []RequestHook{DefaultRequestHook},
-	}
-}
-
 func (r *Request) WithContext(ctx context.Context) *Request {
 	r.ctx = ctx
 	return r
 }
 
 func (r *Request) Context() context.Context {
+	if r.ctx == nil {
+		r.ctx = context.Background()
+	}
 	return r.ctx
 }
 
